@@ -109,3 +109,19 @@
 - 随机事件（如暴击）的结果已记录在日志中，复现时使用相同的结果
 - 日志中的时间戳是生成时间，不是游戏内时间
 
+## 快照作为测试用例（Snapshot-as-Testcase）
+
+你可以把“战场形势”做成快照文件并在调试面板中恢复，用来验证引擎逻辑。
+但**手动编辑快照**时必须遵守一些硬规则，否则会导致加载后出现隐蔽错误。
+
+### 必须满足的规则（部分）
+- **battleCards.id 唯一**：不能存在“同名卡牌/重复 ID”。
+- **牌组引用一致**：`hand/deck/discardPile` 中引用的 `battleCardId` 必须存在于 `config.battleCards`。
+- **unitTemplates.id 唯一**：模板 ID 不能重复。
+- **单位引用有效模板**：`unit.templateId` 必须存在于 `config.unitTemplates`。
+- **单位坐标合法**：`(row,col)` 不能越界。
+- **占格不冲突**：同一格、同一 `space layer` 不能被两个单位同时占用（空地分层允许同格不同层共存）。
+
+### 自动校验
+引擎在 `restoreBattleSnapshot` 时会执行 `validateBattleSnapshot`，若违反上述规则会直接报错并给出具体原因，方便你修正快照。
+
