@@ -802,9 +802,7 @@ function BattleView({
                     ))
                   })()}
                 </div>
-                <div style={{ marginTop: 4, color: '#9ca3af' }}>
-                  后续可在此接入“上一回合快照 / 事件日志”等更详细调试信息。
-                </div>
+                {/* 快照/日志已在独立选项卡中提供，这里不再保留占位提示 */}
               </div>
             )}
 
