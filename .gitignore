@@ -1,0 +1,42 @@
+# Root-level gitignore for the whole workspace
+
+# Dependencies
+node_modules/
+react-app/node_modules/
+
+# Build outputs
+dist/
+dist-ssr/
+react-app/dist/
+react-app/dist-ssr/
+
+# Vite / tooling caches
+react-app/.vite/
+react-app/.cache/
+
+# Local env
+.env
+.env.*
+*.local
+
+# Logs / exported artifacts
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.idea/
+.vscode/
+
+
