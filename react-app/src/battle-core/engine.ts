@@ -3088,9 +3088,105 @@ export function restoreBattleSnapshot(snapshot: BattleSnapshot): BattleState {
     console.warn(`[快照] 版本不匹配: 快照版本 ${snapshot.version}, 当前支持 1.0.0`)
   }
 
+  // 手动编辑快照时很容易破坏规则：这里做一次轻量校验，失败时给出明确错误
+  const validation = validateBattleSnapshot(snapshot)
+  if (!validation.ok) {
+    throw new Error(`[快照] 校验失败：\n- ${validation.errors.join('\n- ')}`)
+  }
+
   // 直接返回快照中的状态（已经是深拷贝）
   // 注意：恢复后的状态中，damageHistory 不包含计算值，这些值会在需要时实时计算
   return snapshot.battleState
+}
+
+/**
+ * 快照校验（用于“快照当测试用例”场景）
+ * 目标：尽早发现“同名/重复ID、引用不一致、占格冲突”等问题，避免加载后出现隐蔽Bug。
+ */
+export function validateBattleSnapshot(
+  snapshot: BattleSnapshot,
+): { ok: true } | { ok: false; errors: string[] } {
+  const errors: string[] = []
+  const state = snapshot.battleState
+
+  if (!state?.config) {
+    return { ok: false, errors: ['battleState/config 缺失'] }
+  }
+
+  const rows = state.config.battlefield.rows
+  const cols = state.config.battlefield.cols
+
+  // 1) battleCards：id 唯一，且 deck/hand 引用必须存在
+  const battleCardIds = state.config.battleCards.map((c) => c.id)
+  const battleCardIdSet = new Set(battleCardIds)
+  if (battleCardIdSet.size !== battleCardIds.length) {
+    errors.push('battleCards 中存在重复的 card.id（同名卡牌/重复ID）')
+  }
+
+  const allDeckRefs = [
+    ...state.player.hand,
+    ...state.player.deck,
+    ...state.enemy.hand,
+    ...state.enemy.deck,
+    ...state.player.discardPile,
+    ...state.enemy.discardPile,
+  ]
+  for (const ref of allDeckRefs) {
+    if (!battleCardIdSet.has(ref)) {
+      errors.push(`牌组引用了不存在的 battleCardId：${ref}`)
+    }
+  }
+
+  // 2) unitTemplates：id 唯一；battleCards.unitTemplateId 必须存在（单位卡）
+  const tplIds = state.config.unitTemplates.map((t) => t.id)
+  const tplIdSet = new Set(tplIds)
+  if (tplIdSet.size !== tplIds.length) {
+    errors.push('unitTemplates 中存在重复的 template.id')
+  }
+  for (const c of state.config.battleCards) {
+    if (c.type === 'unit') {
+      if (!c.unitTemplateId) errors.push(`单位卡 battleCard(${c.id}) 缺少 unitTemplateId`)
+      else if (!tplIdSet.has(c.unitTemplateId)) {
+        errors.push(`battleCard(${c.id}) 引用了不存在的 unitTemplateId：${c.unitTemplateId}`)
+      }
+    }
+  }
+
+  // 3) units：id 唯一；坐标合法；templateId 必须存在；grid 占格一致性（同格同层不能重复）
+  const unitIds = Object.keys(state.units)
+  const unitIdSet = new Set(unitIds)
+  if (unitIdSet.size !== unitIds.length) {
+    errors.push('units 中存在重复的 unitId key（对象键异常）')
+  }
+
+  // 同格同层占用检测（由 units 的 row/col 推导）
+  const occupancy = new Map<string, string>() // `${r},${c},${space}` -> unitId
+  for (const u of Object.values(state.units)) {
+    if (u.row < 0 || u.row >= rows || u.col < 0 || u.col >= cols) {
+      errors.push(`unit(${u.id}) 坐标越界：(${u.row},${u.col})`)
+      continue
+    }
+    if (!tplIdSet.has(u.templateId)) {
+      errors.push(`unit(${u.id}) 引用了不存在的 templateId：${u.templateId}`)
+    }
+
+    // 若有关联卡牌，则要求该 battleCard 存在
+    if (u.cardId && !battleCardIdSet.has(u.cardId)) {
+      errors.push(`unit(${u.id}) 的 cardId 不存在于 battleCards：${u.cardId}`)
+    }
+
+    const tpl = state.config.unitTemplates.find((t) => t.id === u.templateId)
+    const space = (tpl?.space ?? u.deployTargetSpace ?? 'ground') as string
+    const key = `${u.row},${u.col},${space}`
+    const existed = occupancy.get(key)
+    if (existed) {
+      errors.push(`同一格同一层重复占用：(${u.row},${u.col}) layer=${space} units=${existed},${u.id}`)
+    } else {
+      occupancy.set(key, u.id)
+    }
+  }
+
+  return errors.length === 0 ? { ok: true } : { ok: false, errors }
 }
 
 /**
