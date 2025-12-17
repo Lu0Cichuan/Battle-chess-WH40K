@@ -18,6 +18,7 @@ import {
 import { sampleBattleConfig } from './battle-core/sampleConfig'
 import type { BattleState, CardInventory, BattleLog, BattleLogEntry, BattleSnapshot } from './battle-core/types'
 import { galaxies, initialInventory, type Galaxy } from './battle-core/campaignConfig'
+import { ModdingPanel } from './modding/ModdingPanel'
 import './index.css'
 
 type UIMode = 'mainMenu' | 'battle'
@@ -35,7 +36,9 @@ function BattleView({
 }) {
   const [selectedHandIndex, setSelectedHandIndex] = useState<number | null>(null)
   const [debugOpen, setDebugOpen] = useState(false)
-  const [debugTab, setDebugTab] = useState<'overview' | 'units' | 'commands' | 'snapshot' | 'log'>('overview')
+  const [debugTab, setDebugTab] = useState<
+    'overview' | 'units' | 'commands' | 'modding' | 'snapshot' | 'log'
+  >('overview')
   const [debugSelectedUnitId, setDebugSelectedUnitId] = useState<string | null>(null)
 
   const { battlefield, battleCards, unitTemplates, resourceRule } = battleState.config
@@ -705,6 +708,7 @@ function BattleView({
               { id: 'overview' as const, label: '总览' },
               { id: 'units' as const, label: '单位' },
               { id: 'commands' as const, label: '指令' },
+              { id: 'modding' as const, label: '模组/卡牌' },
               { id: 'snapshot' as const, label: '快照' },
               { id: 'log' as const, label: '日志' },
             ].map((tab) => (
@@ -802,6 +806,15 @@ function BattleView({
                   后续可在此接入“上一回合快照 / 事件日志”等更详细调试信息。
                 </div>
               </div>
+            )}
+
+            {debugTab === 'modding' && (
+              <ModdingPanel
+                battleState={battleState}
+                setBattleState={setBattleState as unknown as (
+                  updater: BattleState | ((prev: BattleState) => BattleState)
+                ) => void}
+              />
             )}
 
             {debugTab === 'units' && (
