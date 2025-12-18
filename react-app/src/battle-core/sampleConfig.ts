@@ -151,7 +151,7 @@ const artillery: UnitTemplate = {
     moveSpeed: 0, // 不移动，站桩输出
     range: 4, // 较长射程，便于演示
   },
-  tags: ['artillery', 'ranged'],
+  tags: ['artillery', 'ranged', 'requires_setup', 'requires_cooldown_after_attack'],
   behavior: {
     movePattern: 'no_move',
     attackPattern: 'closest_in_row',
@@ -226,7 +226,7 @@ const orkBoy: UnitTemplate = {
     moveSpeed: 1,
     range: 1,
   },
-  tags: ['infantry', 'melee'],
+  tags: ['infantry', 'melee', 'limit_move_speed_to_1'],
   behavior: {
     movePattern: 'standard_advance',
     attackPattern: 'closest_in_row',
