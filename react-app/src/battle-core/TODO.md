@@ -231,11 +231,11 @@
  - [x] 将敌方 AI 的部署/补牌逻辑迁移到 `aiSystem.ts`，并保留与日志系统的对接（部署行为可诊断）。
  - [x] 将勇气光环等 Buff/状态效果的应用迁移到 `effectSystem.ts`，作为 Effect System 的首个落地点。
  - [x] 收缩 `engine.ts` 为“System Manager”，只负责回合流程和各 System 的调用顺序，不再塞进具体规则细节。
- - [ ] 数据驱动化与去硬编码：用标签/能力配置替代基于 `template.id` 的特判
+- [ ] 数据驱动化与去硬编码：用标签/能力配置替代基于 `template.id` 的特判
   - [x] 在 `UnitTemplate` 中为帝国火炮与兽人小子补充语义化标签（如 `requires_cooldown_after_attack`、`limit_move_speed_to_1`），作为数据驱动的基础。
   - [x] 初步清理 `performAttacks` 与移动逻辑中对 `imperium-artillery` / `ork-boy` 的硬编码分支，改为基于 `template.tags` 的条件判断。
- - [ ] 继续梳理并移除其他基于 `template.id` 的硬编码逻辑，统一使用 `tags/capabilities` 表达规则意图。（目前已将勇气光环法术和火炮冷却逻辑改为基于 `tags`，后续扩展到更多单位）
-  - [ ] 在配置样例与文档中约定常用 tag 语义，避免未来新增种族/单位时需要改引擎代码。
+- [x] 继续梳理并移除其他基于 `template.id` 的硬编码逻辑，统一使用 `tags/capabilities` 表达规则意图。（目前已将勇气光环法术和火炮冷却逻辑改为基于 `tags`，后续扩展到更多单位）
+  - [x] 在配置样例与文档中约定常用 tag 语义，避免未来新增种族/单位时需要改引擎代码。
 - [ ] 状态更新方式优化：引入 Immer.js 或等价方案，简化不可变状态更新
   - [x] 使用 Immer（`produce`）在士气更新函数 `updateMorale` 中做首次试点重构，验证引入 Immer 后序列化与日志/快照行为正常。
   - [ ] 在更多深层状态更新场景（单位 HP/状态、格子占用等）中逐步迁移到 Immer，避免手写多层 `{...state, units: {...state.units}}` 导致漏拷贝或 React 不更新。

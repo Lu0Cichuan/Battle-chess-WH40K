@@ -48,6 +48,13 @@
 - 将部分基于 `template.id` 的分支改为基于 `tags` 的数据驱动判断：
   - 勇气光环：从 `template.id === 'courage-aura'` 改为检测 `tags` 中是否同时包含 `spell` 与 `buff`。
   - 帝国火炮冷却：从 `template.id === 'imperium-artillery'` 改为检测 `tags` 中是否包含 `requires_cooldown_after_attack`。
+- 对 `engine.ts` 及 `damage/movement/ai/effect` 四个 System 进行梳理，**移除所有与规则相关的 `template.id === 'xxx'` 硬编码判断**，仅在示例 `sampleConfig` 与 demo 预设手牌中保留“场景配置用”的模板 ID 过滤。
+- 初步约定并落地了一批**通用 tags 语义**（在 `sampleConfig.ts` 中使用，在本日志中文档化），后续新增单位/种族可直接复用：
+  - `spell`：表示该模板为法术型单位（不会作为常规战斗单位部署），目前用于 UI 与施法入口识别。
+  - `buff`：该模板的主要效果是增益/减益（如勇气光环）；与 `spell` 组合用于定位“增益类法术”。
+  - `requires_cooldown_after_attack`：攻击后进入强制冷却一回合（当前用于帝国火炮），由攻击系统在结算后附加冷却。
+  - `limit_move_speed_to_1`：限制该单位的单回合前进步数为 1（无论地形加成/士气效果），用于表现笨重单位。
+  - （预留）`ignores_terrain_block` / `flying`：未来用于空军/浮空单位，忽略部分或全部地面阻挡判定。
 
 ### 补充（自动化测试基础设施）
 - 引入 **Vitest** 作为测试框架：
