@@ -3,7 +3,7 @@
  * 在浏览器环境中，通过下载API保存日志文件
  */
 
-import { BattleLog, BattleLogEntry } from './types'
+import type { BattleLog, BattleLogEntry } from './types'
 
 /**
  * 保存日志到文件（浏览器环境）

@@ -1,4 +1,4 @@
-import type { BattleState, CardInventory, BattleResult } from './types'
+import type { BattleState, BattleResult } from './types'
 import { calculateBattleResult } from './engine'
 import { testInventory } from './testInventory'
 
@@ -56,6 +56,7 @@ export function testBattleResultCalculation(battleState: BattleState): void {
 export function getBattleResult(battleState: BattleState): BattleResult {
   return calculateBattleResult(battleState, testInventory)
 }
+
 
 
 

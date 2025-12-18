@@ -8,7 +8,6 @@ import {
   debugRemoveUnit,
   debugDeployUnit,
   debugAddCommandPoints,
-  debugAddCardToHand,
   exportBattleSnapshot,
   restoreBattleSnapshot,
   addBattleLogEntry,
@@ -18,6 +17,7 @@ import {
 import { sampleBattleConfig } from './battle-core/sampleConfig'
 import type { BattleState, CardInventory, BattleLog, BattleLogEntry, BattleSnapshot } from './battle-core/types'
 import { galaxies, initialInventory, type Galaxy } from './battle-core/campaignConfig'
+import { ModdingPanel } from './modding/ModdingPanel'
 import './index.css'
 
 type UIMode = 'mainMenu' | 'battle'
@@ -29,13 +29,15 @@ function BattleView({
   setBattleLog,
 }: {
   battleState: BattleState
-  setBattleState: (updater: (prev: BattleState) => BattleState) => void
+  setBattleState: (updater: BattleState | ((prev: BattleState) => BattleState)) => void
   battleLog: BattleLog
   setBattleLog: (log: BattleLog | ((prev: BattleLog) => BattleLog)) => void
 }) {
   const [selectedHandIndex, setSelectedHandIndex] = useState<number | null>(null)
   const [debugOpen, setDebugOpen] = useState(false)
-  const [debugTab, setDebugTab] = useState<'overview' | 'units' | 'commands' | 'snapshot' | 'log'>('overview')
+  const [debugTab, setDebugTab] = useState<
+    'overview' | 'units' | 'commands' | 'modding' | 'snapshot' | 'log'
+  >('overview')
   const [debugSelectedUnitId, setDebugSelectedUnitId] = useState<string | null>(null)
 
   const { battlefield, battleCards, unitTemplates, resourceRule } = battleState.config
@@ -156,8 +158,11 @@ function BattleView({
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
         return
       }
-      // 反引号键（通常在数字1左侧）
-      if (e.key === '`') {
+      // 调试面板快捷键：
+      // - 用 e.code 兼容不同键盘布局（Backquote）
+      // - 同时保留 e.key 兼容旧逻辑
+      const isBackquote = e.code === 'Backquote' || e.key === '`' || e.key === '｀' || e.key === '~'
+      if (isBackquote) {
         e.preventDefault()
         setDebugOpen((prev) => !prev)
       }
@@ -401,10 +406,7 @@ function BattleView({
               
               // 检查是否有第二个单位（地面+空中同时存在）
               const hasSecondUnit = (airUnitId && groundUnitId) || (airUnitId && fullUnitId) || (groundUnitId && fullUnitId)
-              const secondUnitId = hasSecondUnit 
-                ? (airUnitId && groundUnitId ? (primaryUnitId === airUnitId ? groundUnitId : airUnitId) : null)
-                : null
-              const secondUnit = secondUnitId ? battleState.units[secondUnitId] : null
+              void hasSecondUnit
 
               return (
                 <div
@@ -627,10 +629,10 @@ function BattleView({
           className="grid grid-cols-2 gap-2"
           style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}
         >
-          <div>
+      <div>
             <div className="text-slate-400" style={{ color: '#9ca3af' }}>
               手牌 / 牌堆 / 弃牌
-            </div>
+      </div>
             <div>手牌：{battleState.player.hand.length}</div>
             <div>牌堆：{battleState.player.deck.length}</div>
             <div>弃牌堆：{battleState.player.discardPile.length}</div>
@@ -690,8 +692,8 @@ function BattleView({
               }}
             >
               关闭
-            </button>
-          </div>
+        </button>
+      </div>
 
           {/* Tab 切换 */}
           <div
@@ -705,6 +707,7 @@ function BattleView({
               { id: 'overview' as const, label: '总览' },
               { id: 'units' as const, label: '单位' },
               { id: 'commands' as const, label: '指令' },
+              { id: 'modding' as const, label: '模组/卡牌' },
               { id: 'snapshot' as const, label: '快照' },
               { id: 'log' as const, label: '日志' },
             ].map((tab) => (
@@ -798,10 +801,17 @@ function BattleView({
                     ))
                   })()}
                 </div>
-                <div style={{ marginTop: 4, color: '#9ca3af' }}>
-                  后续可在此接入“上一回合快照 / 事件日志”等更详细调试信息。
-                </div>
+                {/* 快照/日志已在独立选项卡中提供，这里不再保留占位提示 */}
               </div>
+            )}
+
+            {debugTab === 'modding' && (
+              <ModdingPanel
+                battleState={battleState}
+                setBattleState={setBattleState as unknown as (
+                  updater: BattleState | ((prev: BattleState) => BattleState)
+                ) => void}
+              />
             )}
 
             {debugTab === 'units' && (
@@ -877,8 +887,8 @@ function BattleView({
                           {unit.currentHp}/{unit.maxHp}
                         </div>
                         <div>
-                          <span style={{ fontWeight: 600 }}>基础物攻 / 法攻：</span>
-                          {tpl?.baseStats?.attack ?? '-'} / {tpl?.baseStats?.magicAttack ?? '0'}
+                          <span style={{ fontWeight: 600 }}>基础攻击：</span>
+                          {tpl?.baseStats?.attack ?? '-'}
                         </div>
                         {(() => {
                           // 计算实际攻击力（基础攻击 + 士气加成 + Buff加成 + 地形加成）
