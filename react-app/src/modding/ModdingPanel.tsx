@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { BattleCard, BattleState, UnitTemplate } from '../battle-core/types'
 
 type DeckTarget = 'playerHand' | 'playerDeck' | 'enemyHand' | 'enemyDeck'

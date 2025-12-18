@@ -30,6 +30,42 @@
 - **技能系统**：目前仍是设计阶段（本文件 2025-12-16），尚未把“普通攻击”统一到技能系统执行框架。
 - **更强的回放**：目前“快照+日志”已具备诊断能力，但仍缺少“操作输入（玩家指令）”的结构化记录与回放播放器。
 
+## 2025-12-18（引擎系统化重构：Damage/Movement/AI/Effect）
+
+### 目标
+- 按 System 拆分 `engine.ts`：将具体规则逻辑逐步迁移到 `damageSystem` / `movementSystem` / `aiSystem` / `effectSystem`，`engine.ts` 收缩为“System Manager”。
+- 保持行为与日志字段不变，并持续保持 `npm run build` 通过。
+
+### 已完成
+- **damageSystem**：抽离纯数值伤害计算（`calculateDamageAgainstUnit` 等），`engine.ts` 不再维护旧同名伤害管线，避免“两套规则漂移”。
+- **movementSystem**：抽离 `moveUnitsForward`（通过 deps 注入），`engine.ts` 只保留调度壳。
+- **aiSystem**：抽离敌方补牌与简易自动部署：
+  - `fillHandForEnemy`
+  - `autoDeployEnemyUnit`
+- **effectSystem（首个落地点）**：迁移 `courage-aura`（勇气光环）效果实现到 `effectSystem.ts`，由 `engine.ts` 调用。
+
+### 补充（数据驱动与去硬编码）
+- 将部分基于 `template.id` 的分支改为基于 `tags` 的数据驱动判断：
+  - 勇气光环：从 `template.id === 'courage-aura'` 改为检测 `tags` 中是否同时包含 `spell` 与 `buff`。
+  - 帝国火炮冷却：从 `template.id === 'imperium-artillery'` 改为检测 `tags` 中是否包含 `requires_cooldown_after_attack`。
+
+### 补充（自动化测试基础设施）
+- 引入 **Vitest** 作为测试框架：
+  - 在 `react-app/package.json` 中新增脚本：
+    - `"test": "vitest run"`
+    - `"test:watch": "vitest"`
+  - 新增 `vitest.config.ts`，将 `src/battle-core/**/*.spec.ts` 作为默认测试入口，测试环境使用 `jsdom`。
+- 为 `damageSystem.ts` 添加首个单元测试 `damageSystem.spec.ts`：
+  - 覆盖 `getDamageTypeForTemplate` 的默认行为（无配置时回退为 `physical`）。
+  - 构造最小 `BattleState` 与攻防模板，在关闭暴击/忽略士气/无地形加成的前提下调用 `calculateDamageAgainstUnit`，断言输出伤害为正且在合理范围内。
+- 使用建议：
+  - 运行全部测试：在 `react-app` 目录执行 `npm test`。
+  - 持续开发时监听测试：执行 `npm run test:watch`。
+  - 后续可在 `src/battle-core` 下继续添加 `*.spec.ts` 文件，为 `movementSystem`、`effectSystem`、关键引擎编排函数等补充回归用例。
+
+### 备注
+- 调试面板快捷键兼容性增强：从只判断 ``e.key === '`'`` 改为优先使用 `e.code === 'Backquote'`，兼容不同键盘布局。
+
 ### 进展补充：模组/模板与卡牌编辑器（MVP）
 - **分支**：`feat/mods-and-cards`
 - **实现内容**（当前阶段符合“先简化：JSON 导入/导出 + 生成卡牌”的预期）：

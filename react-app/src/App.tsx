@@ -8,7 +8,6 @@ import {
   debugRemoveUnit,
   debugDeployUnit,
   debugAddCommandPoints,
-  debugAddCardToHand,
   exportBattleSnapshot,
   restoreBattleSnapshot,
   addBattleLogEntry,
@@ -30,7 +29,7 @@ function BattleView({
   setBattleLog,
 }: {
   battleState: BattleState
-  setBattleState: (updater: (prev: BattleState) => BattleState) => void
+  setBattleState: (updater: BattleState | ((prev: BattleState) => BattleState)) => void
   battleLog: BattleLog
   setBattleLog: (log: BattleLog | ((prev: BattleLog) => BattleLog)) => void
 }) {
@@ -159,8 +158,11 @@ function BattleView({
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
         return
       }
-      // 反引号键（通常在数字1左侧）
-      if (e.key === '`') {
+      // 调试面板快捷键：
+      // - 用 e.code 兼容不同键盘布局（Backquote）
+      // - 同时保留 e.key 兼容旧逻辑
+      const isBackquote = e.code === 'Backquote' || e.key === '`' || e.key === '｀' || e.key === '~'
+      if (isBackquote) {
         e.preventDefault()
         setDebugOpen((prev) => !prev)
       }
@@ -404,10 +406,7 @@ function BattleView({
               
               // 检查是否有第二个单位（地面+空中同时存在）
               const hasSecondUnit = (airUnitId && groundUnitId) || (airUnitId && fullUnitId) || (groundUnitId && fullUnitId)
-              const secondUnitId = hasSecondUnit 
-                ? (airUnitId && groundUnitId ? (primaryUnitId === airUnitId ? groundUnitId : airUnitId) : null)
-                : null
-              const secondUnit = secondUnitId ? battleState.units[secondUnitId] : null
+              void hasSecondUnit
 
               return (
                 <div
@@ -630,10 +629,10 @@ function BattleView({
           className="grid grid-cols-2 gap-2"
           style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}
         >
-          <div>
+      <div>
             <div className="text-slate-400" style={{ color: '#9ca3af' }}>
               手牌 / 牌堆 / 弃牌
-            </div>
+      </div>
             <div>手牌：{battleState.player.hand.length}</div>
             <div>牌堆：{battleState.player.deck.length}</div>
             <div>弃牌堆：{battleState.player.discardPile.length}</div>
@@ -693,8 +692,8 @@ function BattleView({
               }}
             >
               关闭
-            </button>
-          </div>
+        </button>
+      </div>
 
           {/* Tab 切换 */}
           <div
@@ -888,8 +887,8 @@ function BattleView({
                           {unit.currentHp}/{unit.maxHp}
                         </div>
                         <div>
-                          <span style={{ fontWeight: 600 }}>基础物攻 / 法攻：</span>
-                          {tpl?.baseStats?.attack ?? '-'} / {tpl?.baseStats?.magicAttack ?? '0'}
+                          <span style={{ fontWeight: 600 }}>基础攻击：</span>
+                          {tpl?.baseStats?.attack ?? '-'}
                         </div>
                         {(() => {
                           // 计算实际攻击力（基础攻击 + 士气加成 + Buff加成 + 地形加成）

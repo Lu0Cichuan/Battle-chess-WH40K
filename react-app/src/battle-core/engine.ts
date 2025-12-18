@@ -1,8 +1,22 @@
+import { produce, setAutoFreeze } from 'immer'
+import {
+  calculateDamageAgainstUnit as calculateDamageAgainstUnitExternal,
+  getDamageTypeForTemplate as getDamageTypeForTemplateExternal,
+} from './damageSystem'
+
+// 重要说明：
+// 当前引擎中仍有大量“看起来可变”的状态更新逻辑（直接修改 grid/units 等）。
+// Immer 在开发模式下默认会对 produce 返回的对象做深度冻结（autoFreeze），
+// 这会导致后续对同一份 state 的直接修改抛出
+// “Cannot assign to read only property ... of object '[object Array]'” 之类的错误。
+// 在我们尚未全量迁移到 Immer 写法之前，先全局关闭 autoFreeze，避免与现有可变逻辑冲突。
+setAutoFreeze(false)
 import type {
   BattleConfig,
   BattleState,
   BattlefieldGrid,
   CellLayers,
+  Owner,
   PlayerBattleState,
   UnitInstance,
   UnitTemplate,
@@ -16,7 +30,15 @@ import type {
   BattleLog,
   BattleLogEntry,
   LogEntryType,
+  SpaceLayer,
+  Base,
+  SimplifiedDamageLogEntry,
+  BattlePhase,
 } from './types'
+
+import { moveUnitsForward as moveUnitsForwardExternal } from './movementSystem'
+import { autoDeployEnemyUnit as autoDeployEnemyUnitExternal, fillHandForEnemy as fillHandForEnemyExternal } from './aiSystem'
+import { applyCourageAura as applyCourageAuraExternal } from './effectSystem'
 
 export function createEmptyGrid(rows: number, cols: number): BattlefieldGrid {
   const grid: BattlefieldGrid = []
@@ -92,265 +114,7 @@ function isTerrainBlocked(cell: TerrainCell, space: SpaceLayer): boolean {
   return false
 }
 
-function getTerrainMoveCost(cell: TerrainCell): number {
-  return cell.effects?.moveCost ?? 1
-}
-
-// =============== 伤害计算管线（基础伤害 -> 伤害倍率 -> 受伤倍率） ===============
-
-// 当前所有单位统一暴击率与暴击伤害
-function getCritParams(): { critRate: number; critMultiplier: number } {
-  return {
-    critRate: 0.1, // 10% 暴击率
-    critMultiplier: 2.0, // 200% 暴击伤害
-  }
-}
-
-function getDamageTypeForTemplate(template: UnitTemplate): DamageType {
-  return template.damageType ?? 'physical'
-}
-
-/**
- * 计算攻击方"有效攻击力"（已包含：基础攻击、Buff加成、士气加成、地形攻击加成）
- * 
- * 伤害管线设计：
- * 1. 基础攻击力（来自模板）
- * 2. + Buff加成（加算，如 attack_up +2）
- * 3. × 士气倍率（乘算，如 1.1 表示 +10%）
- * 4. × 地形攻击倍率（乘算，如 1.2 表示 +20%）
- * 5. × 技能倍率（乘算，如 1.5 表示 150% 攻击力，默认 1.0）
- * 6. × 暴击倍率（乘算，如 2.0 表示 200% 攻击力，仅在暴击时应用）
- * 7. × 溅射系数（乘算，如 0.5 表示 50% 攻击力，用于溅射伤害）
- * 
- * 所有倍率采用乘算，统一在攻击力计算阶段应用，影响后续的攻防差计算
- * 
- * @param skillMultiplier 技能倍率（默认1.0，表示100%攻击力）
- * @param critMultiplier 暴击倍率（默认1.0，仅在暴击时传入实际倍率如2.0）
- */
-function calculateEffectiveAttackValue(
-  template: UnitTemplate,
-  morale: number,
-  attackerTerrain: TerrainCell | null,
-  options?: {
-    splashFactor?: number
-    unitBuffs?: Array<{ type: string; magnitude?: number }>
-    skillMultiplier?: number // 技能倍率（如1.5表示150%攻击力）
-    critMultiplier?: number // 暴击倍率（如2.0表示200%攻击力，仅在暴击时传入）
-  },
-): number {
-  const baseAttack = template.baseStats.attack
-  const moraleBonus = calculateMoraleAttackBonus(morale)
-  const terrainAttackMod = attackerTerrain?.effects?.attackModifier ?? 1
-  const splashFactor = options?.splashFactor ?? 1
-  const skillMultiplier = options?.skillMultiplier ?? 1.0 // 技能倍率，默认1.0
-  const critMultiplier = options?.critMultiplier ?? 1.0 // 暴击倍率，默认1.0
-
-  // 计算Buff加成（attack_up类型，加算）
-  let buffBonus = 0
-  if (options?.unitBuffs) {
-    for (const buff of options.unitBuffs) {
-      if (buff.type === 'attack_up' && buff.magnitude) {
-        buffBonus += buff.magnitude
-      }
-    }
-  }
-
-  // 所有倍率采用乘算：基础攻击力 + Buff → × 士气 → × 地形 → × 技能 → × 暴击 → × 溅射
-  const effective = (baseAttack + buffBonus) * moraleBonus * terrainAttackMod * skillMultiplier * critMultiplier * splashFactor
-  return Math.max(0, effective)
-}
-
-/**
- * 按伤害类型计算"基础伤害"（未乘暴击、未乘受伤倍率）
- * - physical: max(攻-防, 攻*3%) - 取较大值，确保高攻击时造成正常伤害，低攻击时至少造成保底伤害
- * - magic: 攻 * (1 - 魔抗)
- * - true: 直接使用攻值
- */
-function calculateBaseDamageByType(
-  damageType: DamageType,
-  effectiveAttack: number,
-  targetTemplate: UnitTemplate,
-): number {
-  if (damageType === 'physical') {
-    const physDef = targetTemplate.baseStats.physRes
-    const atkMinusDef = Math.max(0, effectiveAttack - physDef)
-    const atkTimes03 = effectiveAttack * 0.03
-    // 修正：使用 max 而不是 min，确保高攻击时造成正常伤害
-    // 当攻击远高于防御时，造成 (攻-防) 的伤害
-    // 当攻击接近或低于防御时，至少造成 攻*3% 的保底伤害
-    const base = Math.max(atkMinusDef, atkTimes03)
-    return Math.max(1, Math.floor(base))
-  }
-
-  if (damageType === 'magic') {
-    // 魔抗以 0~100 的整数表示百分比减伤
-    const magicRes = Math.max(0, Math.min(100, targetTemplate.baseStats.magicRes))
-    const base = effectiveAttack * (1 - magicRes / 100)
-    return Math.max(1, Math.floor(base))
-  }
-
-  // true 伤害：原始值
-  return Math.max(1, Math.floor(effectiveAttack))
-}
-
-/**
- * 应用伤害倍率（已废弃：暴击倍率现在在攻击力计算阶段应用）
- * 
- * 注意：此函数保留用于向后兼容，但实际不再使用
- * 暴击倍率和技能倍率现在在 calculateEffectiveAttackValue 中应用，影响攻击力计算
- * 这样可以确保倍率影响攻防差，而不仅仅是最终伤害
- * 
- * @deprecated 使用 calculateEffectiveAttackValue 中的 skillMultiplier 和 critMultiplier 参数代替
- */
-function applyDamageMultiplier(
-  baseDamage: number,
-  damageType: DamageType,
-  isCrit: boolean,
-): number {
-  // 此函数已不再使用，直接返回基础伤害
-  // 所有倍率（技能倍率、暴击倍率）已在攻击力计算阶段应用
-  return baseDamage
-}
-
-/**
- * 应用受伤倍率（目前只有地形减伤/增伤，未来可扩展物理易伤、法术易伤）
- */
-function applyTakenMultiplier(
-  damageAfterMultiplier: number,
-  damageType: DamageType,
-  defenderTerrain: TerrainCell | null,
-): number {
-  const terrainTakenMod = defenderTerrain?.effects?.damageTakenModifier ?? 1
-  // 未来：根据 damageType 扩展物理/法术易伤
-  const result = damageAfterMultiplier * terrainTakenMod
-  return Math.max(1, Math.floor(result))
-}
-
-/**
- * 统一的对单位造成伤害的计算函数
- * 
- * 伤害管线（方式1：暴击在攻击力阶段应用）：
- * 1. 基础攻击力 + Buff加成（加算）
- * 2. × 士气倍率 × 地形攻击倍率 × 技能倍率 × 暴击倍率 × 溅射系数（乘算）
- * 3. → 最终攻击力
- * 4. → 计算基础伤害（攻防差、保底伤害等）
- * 5. × 受伤倍率（地形减伤等）
- * 6. → 最终伤害
- * 
- * - canCrit: 是否允许暴击（溅射除外情况用 false）
- * - forceCrit: 是否强制暴击（例如：部署信标受到的所有攻击）
- * - splashFactor: 溅射时使用的攻击系数（例如 0.5）
- * - skillMultiplier: 技能倍率（例如 1.5 表示 150% 攻击力，默认 1.0）
- * - ignoreMorale: 是否忽略士气（例如基地攻击时）
- */
-function calculateDamageAgainstUnit(
-  state: BattleState,
-  attackerTemplate: UnitTemplate,
-  attackerOwner: 'player' | 'enemy' | 'neutral',
-  attackerRow: number,
-  attackerCol: number,
-  target: UnitInstance,
-  options?: {
-    damageType?: DamageType
-    canCrit?: boolean
-    forceCrit?: boolean
-    splashFactor?: number
-    skillMultiplier?: number // 技能倍率（如1.5表示150%攻击力）
-    ignoreMorale?: boolean
-    wasSplash?: boolean
-    attackerUnitId?: string | null
-  },
-): {
-  damage: number
-  isCrit: boolean
-  effectiveAttack: number
-  baseDamage: number
-  damageMultiplier: number
-  damageTakenMultiplier: number
-} {
-  const damageType = options?.damageType ?? getDamageTypeForTemplate(attackerTemplate)
-
-  const morale =
-    options?.ignoreMorale === true
-      ? 100
-      : attackerOwner === 'player'
-        ? state.playerMorale
-        : attackerOwner === 'enemy'
-          ? state.enemyMorale
-          : 100
-
-  const attackerTerrain = getTerrainCell(state, attackerRow, attackerCol)
-  const defenderTerrain = getTerrainCell(state, target.row, target.col)
-
-  const targetTemplate =
-    findTemplateById(state.config, target.templateId) ??
-    ({
-      baseStats: { hp: target.maxHp, attack: 0, physRes: 0, magicRes: 0, moveSpeed: 0, range: 1 },
-    } as UnitTemplate)
-
-  // 获取攻击者的Buff（用于计算有效攻击力）
-  const attackerUnit = options?.attackerUnitId ? state.units[options.attackerUnitId] : null
-  const attackerBuffs = attackerUnit?.buffs || []
-
-  // 判断是否暴击
-  const { critRate, critMultiplier } = getCritParams()
-  let isCrit = false
-  if (options?.forceCrit) {
-    isCrit = true
-  } else if (options?.canCrit !== false) {
-    isCrit = Math.random() < critRate
-  }
-
-  // 方式1：暴击倍率在攻击力计算阶段应用（影响攻防差）
-  // 如果暴击，将暴击倍率传入攻击力计算；否则传入1.0
-  const critMultiplierForAttack = isCrit ? critMultiplier : 1.0
-
-  // 计算最终攻击力（已包含所有倍率：士气、地形、技能、暴击、溅射）
-  const effectiveAttack = calculateEffectiveAttackValue(
-    attackerTemplate,
-    morale,
-    attackerTerrain,
-    {
-      splashFactor: options?.splashFactor,
-      unitBuffs: attackerBuffs,
-      skillMultiplier: options?.skillMultiplier,
-      critMultiplier: critMultiplierForAttack, // 暴击倍率在攻击力阶段应用
-    },
-  )
-
-  // 使用最终攻击力计算基础伤害
-  const baseDamage = calculateBaseDamageByType(damageType, effectiveAttack, targetTemplate)
-
-  // 伤害倍率（用于显示）：暴击时显示暴击倍率，否则为1.0
-  // 注意：实际伤害已经通过攻击力倍率计算完成，这里仅用于显示
-  const damageMultiplier = isCrit ? critMultiplier : 1.0
-
-  // 应用受伤倍率（地形减伤等）
-  const damageTakenMultiplier = defenderTerrain?.effects?.damageTakenModifier ?? 1
-  const finalDamage = applyTakenMultiplier(baseDamage, damageType, defenderTerrain)
-
-  // 基础调试日志：用于验证伤害管线是否按预期工作
-  console.log('[伤害结算]', {
-    attackerTemplateId: attackerTemplate.id,
-    attackerOwner,
-    targetId: target.id,
-    targetTemplateId: targetTemplate.id,
-    damageType,
-    effectiveAttack: Math.round(effectiveAttack),
-    baseDamage,
-    isCrit,
-    finalDamage,
-  })
-
-  return {
-    damage: finalDamage,
-    isCrit,
-    effectiveAttack,
-    baseDamage,
-    damageMultiplier,
-    damageTakenMultiplier,
-  }
-}
+// 伤害计算管线已迁移至 damageSystem.ts（保持纯计算，避免在 engine.ts 维护两套逻辑）
 
 /**
  * 应用伤害到单位并记录伤害历史
@@ -374,7 +138,7 @@ function applyDamageToUnit(
   },
 ): { damage: number; isCrit: boolean; updatedTarget: UnitInstance; updatedState: BattleState } {
   const targetHpBefore = target.currentHp
-  const damageResult = calculateDamageAgainstUnit(
+  const damageResult = calculateDamageAgainstUnitExternal(
     state,
     attackerTemplate,
     attackerOwner,
@@ -382,6 +146,12 @@ function applyDamageToUnit(
     attackerCol,
     target,
     options,
+    {
+      getTerrainCell,
+      findTemplateById,
+      getMoraleForOwner: (s, owner) =>
+        owner === 'player' ? s.playerMorale : owner === 'enemy' ? s.enemyMorale : 100,
+    },
   )
 
   // 计算新HP：确保在0到maxHp之间
@@ -398,7 +168,7 @@ function applyDamageToUnit(
         turnNumber: state.turnNumber,
         sourceUnitId: options?.attackerUnitId ?? null,
         sourceTemplateId: attackerTemplate.id,
-        damageType: options?.damageType ?? getDamageTypeForTemplate(attackerTemplate),
+        damageType: options?.damageType ?? getDamageTypeForTemplateExternal(attackerTemplate),
         baseDamage: damageResult.baseDamage,
         effectiveAttack: damageResult.effectiveAttack,
         isCrit: damageResult.isCrit,
@@ -424,7 +194,7 @@ function applyDamageToUnit(
   let nextState = addPendingLogEntry(
     state,
     options?.wasSplash ? 'unit_damaged' : 'unit_damaged',
-    `${attackerTemplate.name}(${options?.attackerUnitId || 'unknown'}) 对 ${target.templateId}(${target.id}) 造成 ${damageResult.damage} 点${options?.damageType ?? getDamageTypeForTemplate(attackerTemplate)}伤害${options?.wasSplash ? '（溅射）' : ''}${damageResult.isCrit ? '（暴击）' : ''}`,
+    `${attackerTemplate.name}(${options?.attackerUnitId || 'unknown'}) 对 ${target.templateId}(${target.id}) 造成 ${damageResult.damage} 点${options?.damageType ?? getDamageTypeForTemplateExternal(attackerTemplate)}伤害${options?.wasSplash ? '（溅射）' : ''}${damageResult.isCrit ? '（暴击）' : ''}`,
     {
       attackerUnitId: options?.attackerUnitId,
       attackerTemplateId: attackerTemplate.id,
@@ -433,7 +203,7 @@ function applyDamageToUnit(
       targetUnitId: target.id,
       targetTemplateId: target.templateId,
       targetPosition: { row: target.row, col: target.col },
-      damageType: options?.damageType ?? getDamageTypeForTemplate(attackerTemplate),
+      damageType: options?.damageType ?? getDamageTypeForTemplateExternal(attackerTemplate),
       // 完整的伤害管线信息（用于复现）
       damageCalculation: {
         baseAttack: attackerTemplate.baseStats.attack,
@@ -604,7 +374,13 @@ function placeUnitOnGrid(
   col: number,
   template: UnitTemplate,
 ): void {
-  const cell = grid[row][col]
+  // 为了避免对可能被冻结/只读的格子或行对象直接赋值，这里显式创建新行和新 cell 再替换回去
+  const oldRow = grid[row]
+  const newRow = Array.isArray(oldRow) ? oldRow.slice() : [...oldRow]
+  const oldCell = newRow[col]
+  const cell = {
+    ...oldCell,
+  }
   if (template.space === 'ground') {
     cell.groundUnitId = unitId
   } else if (template.space === 'air') {
@@ -612,15 +388,25 @@ function placeUnitOnGrid(
   } else {
     cell.fullUnitId = unitId
   }
+  newRow[col] = cell
+  grid[row] = newRow
 }
 
 function removeUnitFromGrid(grid: BattlefieldGrid, unitId: string): void {
   for (let r = 0; r < grid.length; r++) {
     for (let c = 0; c < grid[r].length; c++) {
-      const cell = grid[r][c]
-      if (cell.groundUnitId === unitId) cell.groundUnitId = null
-      if (cell.airUnitId === unitId) cell.airUnitId = null
-      if (cell.fullUnitId === unitId) cell.fullUnitId = null
+      const oldCell = grid[r][c]
+      if (
+        oldCell.groundUnitId === unitId ||
+        oldCell.airUnitId === unitId ||
+        oldCell.fullUnitId === unitId
+      ) {
+        const cell = { ...oldCell }
+        if (cell.groundUnitId === unitId) cell.groundUnitId = null
+        if (cell.airUnitId === unitId) cell.airUnitId = null
+        if (cell.fullUnitId === unitId) cell.fullUnitId = null
+        grid[r][c] = cell
+      }
     }
   }
 }
@@ -631,51 +417,26 @@ function findTemplateById(config: BattleConfig, templateId: string): UnitTemplat
 
 // ==================== 士气系统 ====================
 
-/**
- * 计算士气对攻击力的影响
- * @param morale 士气值（0~120）
- * @returns 攻击力加成倍数（例如：1.1 表示 +10%）
- */
-function calculateMoraleAttackBonus(morale: number): number {
-  if (morale > 100) {
-    // 士气 > 100：全体攻击增加（暂定为 +10%）
-    return 1.1
-  } else if (morale < 50) {
-    // 士气 < 50：全体攻击降低（暂定为 -10%）
-    return 0.9
-  }
-  // 50~100：无攻击力加成
-  return 1.0
-}
-
-/**
- * 计算士气对暴击率的影响
- * @param morale 士气值（0~120）
- * @returns 暴击率增益（-5%~5%，线性）
- */
-function calculateMoraleCritBonus(morale: number): number {
-  if (morale >= 50 && morale <= 100) {
-    // 50~100：线性提供 -5%~5% 的暴击率增益
-    // morale = 50 -> -5%, morale = 75 -> 0%, morale = 100 -> +5%
-    return ((morale - 75) / 25) * 5
-  }
-  return 0
-}
-
-// 旧的暴击与伤害计算函数已被统一伤害管线取代
+// 说明：士气对攻击/暴击的数值影响已迁移至 damageSystem（保持单一来源）。
 
 /**
  * 更新士气值（限制在0~120范围内）
  */
 function updateMorale(state: BattleState, owner: 'player' | 'enemy', delta: number): BattleState {
-  const currentMorale = owner === 'player' ? state.playerMorale : state.enemyMorale
-  const newMorale = Math.max(0, Math.min(120, currentMorale + delta))
-  
-  return {
-    ...state,
-    playerMorale: owner === 'player' ? newMorale : state.playerMorale,
-    enemyMorale: owner === 'enemy' ? newMorale : state.enemyMorale,
-  }
+  return produce(state, (draft) => {
+    const currentMorale = owner === 'player' ? draft.playerMorale : draft.enemyMorale
+    const newMorale = Math.max(0, Math.min(120, currentMorale + delta))
+
+    if (owner === 'player') {
+      draft.playerMorale = newMorale
+    } else {
+      draft.enemyMorale = newMorale
+    }
+  })
+}
+
+function toMoraleOwner(owner: Owner): 'player' | 'enemy' {
+  return owner === 'enemy' ? 'enemy' : 'player'
 }
 
 /**
@@ -684,7 +445,7 @@ function updateMorale(state: BattleState, owner: 'player' | 'enemy', delta: numb
 function applyDeployMorale(state: BattleState, unit: UnitInstance, template: UnitTemplate): BattleState {
   const moraleValue = template.deployMoraleValue || 0
   if (moraleValue > 0) {
-    return updateMorale(state, unit.owner, moraleValue)
+    return updateMorale(state, toMoraleOwner(unit.owner), moraleValue)
   }
   return state
 }
@@ -700,7 +461,7 @@ function applyKillMorale(
   const moraleValue = killedUnit.deployMoraleValue || killedTemplate.deployMoraleValue || 0
   
   // 扣除己方士气：1.5倍部署士气值
-  let next = updateMorale(state, killedUnit.owner, -moraleValue * 1.5)
+  let next = updateMorale(state, toMoraleOwner(killedUnit.owner), -moraleValue * 1.5)
   
   // 给对方增加士气：0.5倍部署士气值
   const enemyOwner = killedUnit.owner === 'player' ? 'enemy' : 'player'
@@ -710,18 +471,44 @@ function applyKillMorale(
 }
 
 /**
- * 单位反部署时扣除士气
+ * 部署信标在单位成功落地前被摧毁时的额外士气惩罚
+ * 规则：在正常阵亡士气变化之外，额外扣除 3 倍部署获得的士气值（仅施加给信标所属方）
  */
-function applyUndeployMorale(
+function applyDeployBeaconDestroyedMorale(
   state: BattleState,
-  unit: UnitInstance,
-  template: UnitTemplate,
+  beaconUnit: UnitInstance,
+  targetTemplate: UnitTemplate,
 ): BattleState {
-  const moraleValue = unit.deployMoraleValue || template.deployMoraleValue || 0
-  // 扣除己方士气：0.5倍部署士气值
-  return updateMorale(state, unit.owner, -moraleValue * 0.5)
+  const moraleValue = beaconUnit.deployMoraleValue || targetTemplate.deployMoraleValue || 0
+  if (moraleValue <= 0) {
+    return state
+  }
+
+  const penalty = moraleValue * 3
+
+  // 先应用士气变化
+  let next = updateMorale(state, toMoraleOwner(beaconUnit.owner), -penalty)
+
+  // 再记录一条详细日志，便于复盘
+  next = addPendingLogEntry(
+    next,
+    'morale_changed',
+    `${beaconUnit.templateId}(${beaconUnit.id}) 的部署信标在单位落地前被摧毁，额外损失士气 ${penalty}`,
+    {
+      unitId: beaconUnit.id,
+      templateId: beaconUnit.templateId,
+      owner: beaconUnit.owner,
+      penalty,
+      reason: 'deploy_beacon_destroyed_before_landing',
+    },
+  )
+
+  return next
 }
 
+/**
+ * 单位反部署时扣除士气
+ */
 /**
  * 基地受到攻击时快速降低士气
  * 这里按造成的伤害 * 0.5 递减（向下取整，至少1点），可根据关卡调节
@@ -735,68 +522,10 @@ function applyBaseDamageMorale(
   return updateMorale(state, owner, -moraleLoss)
 }
 
-/**
- * 应用勇气光环法术效果
- * 效果：3x3范围内的友军在下一回合前获得攻击力+2效果，并获得（范围内单位数）*3的士气
- */
 function applyCourageAura(state: BattleState, centerRow: number, centerCol: number): BattleState {
-  const { rows, cols } = state.config.battlefield
-  let next: BattleState = {
-    ...state,
-    units: { ...state.units },
-  }
-
-  // 计算3x3范围内的友军单位
-  const affectedUnits: UnitInstance[] = []
-  for (let dr = -1; dr <= 1; dr++) {
-    for (let dc = -1; dc <= 1; dc++) {
-      const targetRow = centerRow + dr
-      const targetCol = centerCol + dc
-      if (targetRow < 1 || targetRow > rows || targetCol < 1 || targetCol > cols) continue
-
-      const rowIdx = targetRow - 1
-      const colIdx = targetCol - 1
-      const cell = state.grid[rowIdx][colIdx]
-      
-      // 检查该格子是否有友军单位（地面或空中）
-      const unitId = cell.groundUnitId || cell.airUnitId || cell.fullUnitId
-      if (!unitId) continue
-
-      const unit = state.units[unitId]
-      if (!unit || unit.owner !== 'player' || unit.status === 'dead') continue
-      if (unit.isDeployBeacon) continue // 部署信标不受影响
-
-      affectedUnits.push(unit)
-    }
-  }
-
-  // 为范围内的友军单位添加攻击力+2的Buff（持续1回合）
-  const buffId = `courage-aura-${Date.now().toString(36)}`
-  for (const unit of affectedUnits) {
-    const updatedUnit: UnitInstance = {
-      ...unit,
-      buffs: [
-        ...unit.buffs,
-        {
-          id: buffId,
-          templateId: 'courage-aura',
-          type: 'attack_up',
-          remainingTurns: 1,
-          magnitude: 2,
-          sourceUnitId: null, // 法术效果，无来源单位
-        },
-      ],
-    }
-    next.units[unit.id] = updatedUnit
-  }
-
-  // 增加士气：范围内单位数 * 3
-  const moraleGain = affectedUnits.length * 3
-  next = updateMorale(next, 'player', moraleGain)
-
-  console.log(`[勇气光环] 在 (${centerRow},${centerCol}) 施放，影响 ${affectedUnits.length} 个友军单位，获得 ${moraleGain} 士气`)
-
-  return next
+  return applyCourageAuraExternal(state, centerRow, centerCol, {
+    updateMorale,
+  })
 }
 
 export function deployPlayerUnit(state: BattleState, handIndex: number, row: number, col: number): BattleState {
@@ -840,8 +569,8 @@ export function deployPlayerUnit(state: BattleState, handIndex: number, row: num
     // 从手牌中移除法术卡牌
     next.player.hand.splice(handIndex, 1)
 
-    // 根据法术ID应用效果
-    if (template.id === 'courage-aura') {
+    // 根据法术标签应用效果（数据驱动化：不再直接比较 template.id）
+    if (template.tags?.includes('spell') && template.tags?.includes('buff')) {
       next = applyCourageAura(next, row, col)
     }
 
@@ -952,128 +681,11 @@ export function deployPlayerUnit(state: BattleState, handIndex: number, row: num
 }
 
 function autoDeployEnemyUnit(state: BattleState): BattleState {
-  const { battlefield, battleCards, unitTemplates } = state.config
-  const [deployStart, deployEnd] = battlefield.enemyDeployCols
-
-  const enemyHand = state.enemy.hand
-  if (enemyHand.length === 0) return state
-
-  // 选择第一张可负担的单位牌
-  let chosenIndex = -1
-  let chosenTemplate: UnitTemplate | undefined
-  let chosenBattleCard: BattleCard | undefined
-  for (let i = 0; i < enemyHand.length; i++) {
-    const cardId = enemyHand[i]
-    // 敌方可能使用战斗副本，也可能使用旧的卡牌ID（兼容性）
-    const battleCard = battleCards.find((c) => c.id === cardId)
-    if (!battleCard || !battleCard.unitTemplateId) continue
-    const tpl = unitTemplates.find((u) => u.id === battleCard.unitTemplateId)
-    if (!tpl) continue
-    if (state.enemy.commandPoints >= tpl.cost) {
-      chosenIndex = i
-      chosenTemplate = tpl
-      chosenBattleCard = battleCard
-      break
-    }
-  }
-
-  if (chosenIndex === -1 || !chosenTemplate) return state
-
-  const centerRow = Math.floor(battlefield.rows / 2)
-  // 敌方在中间3行推进：centerRow-1, centerRow, centerRow+1
-  const candidateRows = [centerRow - 1, centerRow, centerRow + 1].filter(
-    (r) => r >= 1 && r <= battlefield.rows,
-  )
-  const rowIndex = state.turnNumber % candidateRows.length
-  const targetRow = candidateRows[rowIndex]
-  let targetCol = deployEnd
-
-  const rowIdx = targetRow - 1
-  let colIdx = targetCol - 1
-
-  // 从右往左在部署区内寻找一个空格
-  while (targetCol >= deployStart) {
-    if (!isCellOccupied(state.grid, rowIdx, colIdx)) break
-    targetCol--
-    colIdx--
-  }
-
-  if (targetCol < deployStart) return state
-
-  const unitId = `e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-
-  let next: BattleState = {
-    ...state,
-    grid: state.grid.map((r) => r.map((c) => ({ ...c }))),
-    enemy: {
-      ...state.enemy,
-      hand: [...state.enemy.hand],
-      commandPoints: state.enemy.commandPoints - chosenTemplate.cost,
-    },
-    units: { ...state.units },
-  }
-
-  // 检查是否部署在基地列（基地部署跳过延迟）
-  const isBaseDeployment = targetCol === battlefield.enemyBaseCol
-
-  // 获取单位数据（优先使用战斗副本，否则使用模板基础值）
-  const unitMaxHp = chosenBattleCard ? chosenBattleCard.maxHp : chosenTemplate.baseStats.hp
-  const unitCurrentHp = chosenBattleCard ? chosenBattleCard.currentHp : unitMaxHp
-
-  // 如果部署在基地列，跳过部署延迟，直接创建单位
-  // 否则，如果有部署延迟，创建部署信标
-  if (isBaseDeployment || chosenTemplate.deployDelayTurns === 0) {
-    // 直接部署单位（基地部署或无需延迟）
-    // 但需要标记为刚部署，本回合不行动
-    const newUnit: UnitInstance = {
-      id: unitId,
-      templateId: chosenTemplate.id,
-      owner: 'enemy',
-      row: targetRow,
-      col: targetCol,
-      currentHp: unitCurrentHp,
-      maxHp: unitMaxHp,
-      status: 'just_deployed', // 标记为刚部署，本回合不行动
-      remainingDeployTurns: 0,
-      remainingUndeployTurns: 0,
-      cardId: chosenBattleCard?.id || null,
-      buffs: [],
-      deployMoraleValue: chosenTemplate.deployMoraleValue || 0, // 记录部署士气值
-      justDeployedThisTurn: true, // 标记为刚部署
-    }
-    // 基地部署立即生效，立即应用士气
-    next = applyDeployMorale(next, newUnit, chosenTemplate)
-    placeUnitOnGrid(next.grid, unitId, rowIdx, colIdx, chosenTemplate)
-    next.units[unitId] = newUnit
-  } else {
-    // 创建部署信标
-    const beaconId = `beacon-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-    const deployBeacon: UnitInstance = {
-      id: beaconId,
-      templateId: chosenTemplate.id,
-      owner: 'enemy',
-      row: targetRow,
-      col: targetCol,
-      // 信标继承被部署单位的生命值（可以被摧毁）
-      currentHp: unitCurrentHp,
-      maxHp: unitMaxHp,
-      status: 'in_deploy_queue',
-      remainingDeployTurns: chosenTemplate.deployDelayTurns,
-      remainingUndeployTurns: 0,
-      cardId: null,
-      buffs: [],
-      isDeployBeacon: true,
-      deployTargetCardId: chosenBattleCard?.id || null,
-      deployTargetTemplateId: chosenTemplate.id,
-      deployTargetSpace: chosenTemplate.space,
-    }
-    placeUnitOnGrid(next.grid, beaconId, rowIdx, colIdx, chosenTemplate)
-    next.units[beaconId] = deployBeacon
-  }
-  // 从手牌中移除已部署的卡牌
-  next.enemy.hand.splice(chosenIndex, 1)
-
-  return next
+  return autoDeployEnemyUnitExternal(state, {
+    isCellOccupied,
+    placeUnitOnGrid,
+    applyDeployMorale,
+  })
 }
 
 // 计算单位的移动优先级，用于排序
@@ -1247,303 +859,17 @@ function getAttackableTargetsForUnit(
 }
 
 function moveUnitsForward(state: BattleState): BattleState {
-  let next: BattleState = {
-    ...state,
-    grid: state.grid.map((r) => r.map((c) => ({ ...c }))),
-    units: { ...state.units },
-  }
-
-  const { battlefield } = state.config
-
-  // 只有状态为 'on_field' 且不是刚部署的单位才能移动
-  const unitsArray = Object.values(state.units).filter(
-    (u) => u.status === 'on_field' && !u.justDeployedThisTurn,
-  )
-
-  // 按照移动优先级排序，优先级高的先移动
-  // 这样可以确保后面的单位先移动，避免被前面的单位卡住
-  const sortedUnitsArray = unitsArray.sort((a, b) => {
-    const templateA = findTemplateById(state.config, a.templateId)
-    const templateB = findTemplateById(state.config, b.templateId)
-    if (!templateA || !templateB) return 0
-
-    const priorityA = calculateMovePriority(a, templateA, state.config)
-    const priorityB = calculateMovePriority(b, templateB, state.config)
-
-    // 优先级高的先移动（降序）
-    return priorityB - priorityA
+  return moveUnitsForwardExternal(state, {
+    findTemplateById,
+    calculateMovePriority,
+    getForwardDirectionForOwner,
+    getTerrainCell,
+    isTerrainBlocked,
+    isCellOccupied,
+    removeUnitFromGrid,
+    placeUnitOnGrid,
+    addPendingLogEntry,
   })
-
-  for (const unit of sortedUnitsArray) {
-    const template = findTemplateById(state.config, unit.templateId)
-    if (!template) continue
-    if (template.behavior.movePattern !== 'standard_advance') continue
-
-    const dir = getForwardDirectionForOwner(unit.owner === 'neutral' ? 'player' : unit.owner, state.config)
-    const maxCol =
-      unit.owner === 'player'
-        ? battlefield.playerAdvanceMaxCol
-        : unit.owner === 'enemy'
-          ? battlefield.enemyAdvanceMaxCol
-          : dir === 1
-            ? battlefield.enemyAdvanceMaxCol
-            : battlefield.playerAdvanceMaxCol
-
-    // 士气效果：兽人在士气>100时，不被阻挡的情况下额外移动一格
-    const morale = unit.owner === 'player' ? state.playerMorale : state.enemyMorale
-    const enemyFaction = state.config.enemyFaction
-    const isOrkEnemy = unit.owner === 'enemy' && enemyFaction === 'ork'
-    
-    // 兽人低士气效果：士气<50时，有一定概率后退或不移动
-    if (isOrkEnemy && morale < 50) {
-      const retreatChance = (50 - morale) / 50 // 0~50%的概率
-      if (Math.random() < retreatChance) {
-        // 尝试后退（如果后方没有友军）
-        const retreatCol = unit.col - dir
-        if (retreatCol >= 1 && retreatCol <= battlefield.cols) {
-          const retreatColIdx = retreatCol - 1
-          const retreatRowIdx = unit.row - 1
-          // 检查后方是否有友军
-          const hasAllyBehind = Object.values(next.units).some(
-            (u) => u.owner === unit.owner && u.row === unit.row && u.col === retreatCol && u.id !== unit.id,
-          )
-          if (!hasAllyBehind && !isCellOccupied(next.grid, retreatRowIdx, retreatColIdx)) {
-            // 后退
-            removeUnitFromGrid(next.grid, unit.id)
-            const updatedUnit: UnitInstance = {
-              ...unit,
-              row: unit.row,
-              col: retreatCol,
-            }
-            next.units[unit.id] = updatedUnit
-            placeUnitOnGrid(next.grid, unit.id, retreatRowIdx, retreatColIdx, template)
-            // 记录后退日志
-            next = addPendingLogEntry(
-              next,
-              'unit_moved',
-              `${template.name}(${unit.id}) 因低士气从 (${unit.row}, ${unit.col}) 后退到 (${unit.row}, ${retreatCol})`,
-              {
-                unitId: unit.id,
-                templateId: template.id,
-                fromRow: unit.row,
-                fromCol: unit.col,
-                toRow: unit.row,
-                toCol: retreatCol,
-                moveType: 'retreat',
-                reason: 'low_morale',
-                morale,
-              },
-            )
-            continue // 后退后不再前进
-          }
-        }
-        // 如果无法后退，则不移动（跳过前进）
-        continue
-      }
-    }
-
-    const currentRowIdx = unit.row - 1
-    const currentTerrain = getTerrainCell(state, unit.row, unit.col)
-
-    // ========== 引流地形：覆盖本回合移动方向（仅纵向移动一格） ==========
-    const funnelDir = currentTerrain.effects?.directional?.funnelDirection
-    if (funnelDir) {
-      const dr = funnelDir === 'up' ? -1 : 1
-      const targetRow = unit.row + dr
-      const targetCol = unit.col
-
-      if (targetRow >= 1 && targetRow <= battlefield.rows) {
-        const targetRowIdx = targetRow - 1
-        const targetColIdx = targetCol - 1
-        const targetTerrain = getTerrainCell(state, targetRow, targetCol)
-        const targetCell = next.grid[targetRowIdx][targetColIdx]
-
-        // 不能进入阻挡格，不能与任意单位重叠
-        // 注意：根据单位空间类型检查阻挡
-        let targetBlocked = false
-        if (template.space === 'air') {
-          // 空中单位：只被空中单位和全空间单位阻挡
-          targetBlocked = Boolean(targetCell.airUnitId || targetCell.fullUnitId)
-        } else if (template.space === 'ground') {
-          // 地面单位：被所有单位阻挡
-          targetBlocked = Boolean(targetCell.groundUnitId || targetCell.airUnitId || targetCell.fullUnitId)
-        } else {
-          // 全空间单位：被所有单位阻挡
-          targetBlocked = Boolean(targetCell.groundUnitId || targetCell.airUnitId || targetCell.fullUnitId)
-        }
-
-        if (!isTerrainBlocked(targetTerrain, template.space) && !targetBlocked) {
-          // 从旧位置移除
-          removeUnitFromGrid(next.grid, unit.id)
-          // 更新单位坐标
-          const updatedUnit: UnitInstance = {
-            ...unit,
-            row: targetRow,
-            col: targetCol,
-          }
-          next.units[unit.id] = updatedUnit
-          // 放到新位置
-          placeUnitOnGrid(next.grid, unit.id, targetRowIdx, targetColIdx, template)
-          // 记录移动日志（引流移动）
-          next = addPendingLogEntry(
-            next,
-            'unit_moved',
-            `${template.name}(${unit.id}) 因地形引流从 (${unit.row}, ${unit.col}) 移动到 (${targetRow}, ${targetCol})`,
-            {
-              unitId: unit.id,
-              templateId: template.id,
-              fromRow: unit.row,
-              fromCol: unit.col,
-              toRow: targetRow,
-              toCol: targetCol,
-              moveType: 'funnel',
-            },
-          )
-          // 引流移动完成，本回合不再进行前进尝试
-          continue
-        }
-      }
-      // 引流目标不可达：本回合不再进行其他移动，单位停留在原地
-      continue
-    }
-
-    // ========== 正常前进：沿着列方向向前移动 ==========
-    // 基础移动距离来自模板（例如：步兵=1，将来可有更快/更慢单位）
-    let moveDistance = template.baseStats.moveSpeed || 1
-
-    // 地形对移动距离的加成（站立格）
-    // 注意：道路等移动加成只对地面单位生效，空中单位不受影响
-    if (currentTerrain.effects?.moveBonus && template.space === 'ground') {
-      moveDistance += currentTerrain.effects.moveBonus
-    }
-
-    // 兽人高士气效果：士气>100时，不被阻挡的情况下额外移动一格
-    if (isOrkEnemy && morale > 100) {
-      const forwardCol = unit.col + dir
-      if (forwardCol >= 1 && forwardCol <= battlefield.cols) {
-        const forwardColIdx = forwardCol - 1
-        // 检查紧前方是否被阻挡（任何单位都视为阻挡）
-        if (!isCellOccupied(next.grid, currentRowIdx, forwardColIdx)) {
-          moveDistance += 1 // 在基础移动距离上额外移动一格
-        }
-      }
-    }
-
-    // Demo 需求：兽人小子整体行动速度控制为1，便于观察溅射
-    if (template.id === 'ork-boy' && moveDistance > 1) {
-      moveDistance = 1
-    }
-
-    // 尝试从最大移动距离开始，逐级回退，寻找可达的最近格
-    let moved = false
-    for (let step = moveDistance; step >= 1; step -= 1) {
-      const targetCol = unit.col + dir * step
-      if (targetCol < 1 || targetCol > battlefield.cols) continue
-      if ((dir === 1 && targetCol > maxCol) || (dir === -1 && targetCol < maxCol)) continue
-
-      const targetColIdx = targetCol - 1
-      const targetTerrain = getTerrainCell(state, unit.row, targetCol)
-      if (isTerrainBlocked(targetTerrain, template.space)) continue
-      const terrainMoveCost = getTerrainMoveCost(targetTerrain)
-      if (step < terrainMoveCost) continue
-
-      // 不能"跨越"路径上的任何单位（包括敌我双方）
-      // 注意：空中单位只检查空中单位和全空间单位，不被地面单位阻挡
-      let pathBlocked = false
-      for (let k = 1; k <= step; k += 1) {
-        const pathCol = unit.col + dir * k
-        if (pathCol < 1 || pathCol > battlefield.cols) {
-          pathBlocked = true
-          break
-        }
-        const pathColIdx = pathCol - 1
-        const pathCell = next.grid[currentRowIdx][pathColIdx]
-        
-        // 根据单位空间类型检查阻挡
-        if (template.space === 'air') {
-          // 空中单位：只被空中单位和全空间单位阻挡
-          if (pathCell.airUnitId || pathCell.fullUnitId) {
-            pathBlocked = true
-            break
-          }
-        } else if (template.space === 'ground') {
-          // 地面单位：被所有单位阻挡
-          if (pathCell.groundUnitId || pathCell.airUnitId || pathCell.fullUnitId) {
-            pathBlocked = true
-            break
-          }
-        } else {
-          // 全空间单位：被所有单位阻挡
-          if (pathCell.groundUnitId || pathCell.airUnitId || pathCell.fullUnitId) {
-            pathBlocked = true
-            break
-          }
-        }
-      }
-      if (pathBlocked) continue
-
-      // 检查目标格子是否被阻挡（根据单位空间类型）
-      const targetCell = next.grid[currentRowIdx][targetColIdx]
-      if (template.space === 'air') {
-        // 空中单位：只被空中单位和全空间单位阻挡
-        if (targetCell.airUnitId || targetCell.fullUnitId) continue
-      } else if (template.space === 'ground') {
-        // 地面单位：被所有单位阻挡
-        if (targetCell.groundUnitId || targetCell.airUnitId || targetCell.fullUnitId) continue
-      } else {
-        // 全空间单位：被所有单位阻挡
-        if (targetCell.groundUnitId || targetCell.airUnitId || targetCell.fullUnitId) continue
-      }
-
-      // 从旧位置移除
-      removeUnitFromGrid(next.grid, unit.id)
-      // 更新实例坐标
-      const updatedUnit: UnitInstance = {
-        ...unit,
-        row: unit.row,
-        col: targetCol,
-      }
-      next.units[unit.id] = updatedUnit
-      // 放到新位置
-      placeUnitOnGrid(next.grid, unit.id, currentRowIdx, targetColIdx, template)
-      // 记录移动日志（包含移动上下文用于复现）
-      const currentTerrain = getTerrainCell(state, unit.row, unit.col)
-      // targetTerrain 已在上面声明（第1433行），直接使用
-      next = addPendingLogEntry(
-        next,
-        'unit_moved',
-        `${template.name}(${unit.id}) 从 (${unit.row}, ${unit.col}) 移动到 (${unit.row}, ${targetCol})，移动距离 ${step}`,
-        {
-          unitId: unit.id,
-          templateId: template.id,
-          fromRow: unit.row,
-          fromCol: unit.col,
-          toRow: unit.row,
-          toCol: targetCol,
-          moveDistance: step,
-          moveType: 'standard_advance',
-          // 移动上下文（用于复现）
-          moveContext: {
-            baseMoveSpeed: template.baseStats.moveSpeed || 1,
-            terrainMoveBonus: currentTerrain?.effects?.moveBonus ?? 0,
-            terrainMoveCost: getTerrainMoveCost(targetTerrain),
-            morale: unit.owner === 'player' ? state.playerMorale : state.enemyMorale,
-            isOrkEnemy: unit.owner === 'enemy' && state.config.enemyFaction === 'ork',
-            maxCol: maxCol,
-            direction: dir,
-          },
-        },
-      )
-      moved = true
-      break
-    }
-
-    if (!moved) {
-      // 无法移动则保持原地（不做处理）
-    }
-  }
-
-  return next
 }
 
 function performAttacks(state: BattleState): BattleState {
@@ -1565,8 +891,8 @@ function performAttacks(state: BattleState): BattleState {
     if (u.status !== 'on_field' || u.justDeployedThisTurn) return false
     const template = findTemplateById(state.config, u.templateId)
     if (!template) return false
-    // 帝国火炮冷却机制：上一回合开火后，下一回合无法进行任何动作（攻击与移动）
-    if (template.id === 'imperium-artillery' && typeof u.lastActedTurn === 'number') {
+    // 火炮类单位冷却机制：上一回合开火后，下一回合无法进行任何动作（攻击与移动）
+    if (template.tags?.includes('requires_cooldown_after_attack') && typeof u.lastActedTurn === 'number') {
       // 若本回合号与最近一次行动回合号之差为 1，表示刚在上一回合行动过，需要冷却一回合
       if (state.turnNumber - u.lastActedTurn === 1) {
         return false
@@ -1696,7 +1022,6 @@ function performAttacks(state: BattleState): BattleState {
           attackerUnitId: unit.id,
         },
       )
-      const effectiveDamage = damageResult.damage
       const updatedTarget = damageResult.updatedTarget
       next = damageResult.updatedState // 更新状态（包含伤害日志）
 
@@ -1724,9 +1049,11 @@ function performAttacks(state: BattleState): BattleState {
               currentHp: 0,
             }
           }
-
-          // 应用士气变化（按目标单位模板计算）
+          
+          // 应用基础“单位阵亡”士气变化
           next = applyKillMorale(next, bestTarget, killedTemplateForBeacon)
+          // 额外应用“部署信标在落地前被摧毁”的惩罚士气变化
+          next = applyDeployBeaconDestroyedMorale(next, bestTarget, killedTemplateForBeacon)
         } else {
           // 单位被击杀，应用士气变化
           next = applyKillMorale(next, bestTarget, targetTemplate)
@@ -1736,7 +1063,7 @@ function performAttacks(state: BattleState): BattleState {
       }
 
       // 帝国火炮攻击后记录行动回合，用于下一回合冷却（无法行动）
-      if (template.id === 'imperium-artillery') {
+      if (template.tags?.includes('requires_cooldown_after_attack')) {
         const existing = next.units[unit.id]
         if (existing) {
           next.units[unit.id] = { ...existing, lastActedTurn: state.turnNumber }
@@ -1927,7 +1254,7 @@ function performAttacks(state: BattleState): BattleState {
       const distanceToBase = battlefield.enemyBaseCol - unit.col
       if (dir === 1 && distanceToBase > 0 && distanceToBase <= range) {
         // 使用统一伤害管线对敌方基地造成物理伤害（不考虑暴击）
-        const baseDamageResult = calculateDamageAgainstUnit(
+        const baseDamageResult = calculateDamageAgainstUnitExternal(
           state,
           template,
           'player',
@@ -1949,6 +1276,12 @@ function performAttacks(state: BattleState): BattleState {
             buffs: [],
           } as UnitInstance,
           { canCrit: false },
+          {
+            getTerrainCell,
+            findTemplateById,
+            getMoraleForOwner: (s, owner) =>
+              owner === 'player' ? s.playerMorale : owner === 'enemy' ? s.enemyMorale : 100,
+          },
         )
         const inflicted = Math.min(baseDamageResult.damage, next.enemyBase.hp)
         next.enemyBase.hp = Math.max(0, next.enemyBase.hp - inflicted)
@@ -1958,7 +1291,7 @@ function performAttacks(state: BattleState): BattleState {
       const distanceToBase = unit.col - battlefield.playerBaseCol
       if (dir === -1 && distanceToBase > 0 && distanceToBase <= range) {
         // 使用统一伤害管线对我方基地造成物理伤害（不考虑暴击）
-        const baseDamageResult = calculateDamageAgainstUnit(
+        const baseDamageResult = calculateDamageAgainstUnitExternal(
           state,
           template,
           'enemy',
@@ -1979,6 +1312,12 @@ function performAttacks(state: BattleState): BattleState {
             buffs: [],
           } as UnitInstance,
           { canCrit: false },
+          {
+            getTerrainCell,
+            findTemplateById,
+            getMoraleForOwner: (s, owner) =>
+              owner === 'player' ? s.playerMorale : owner === 'enemy' ? s.enemyMorale : 100,
+          },
         )
         const inflicted = Math.min(baseDamageResult.damage, next.playerBase.hp)
         next.playerBase.hp = Math.max(0, next.playerBase.hp - inflicted)
@@ -2234,6 +1573,8 @@ function convertReadyBeaconsToUnits(state: BattleState): BattleState {
   }
 
   // 移除已替换的部署信标
+  // 注意：某些状态来源可能是“只读”或经过冻结/代理处理，直接 delete 属性可能触发运行时错误
+  // 因此这里采用“重建 units 对象”的方式来排除这些信标，避免对原对象执行 delete 操作
   for (const beaconId of beaconsToReplace) {
     const beacon = next.units[beaconId]
     if (beacon) {
@@ -2249,7 +1590,17 @@ function convertReadyBeaconsToUnits(state: BattleState): BattleState {
         },
       )
     }
-    delete next.units[beaconId]
+  }
+
+  if (beaconsToReplace.length > 0) {
+    const beaconIdSet = new Set(beaconsToReplace)
+    const newUnits: typeof next.units = {}
+    for (const unitId in next.units) {
+      if (!beaconIdSet.has(unitId)) {
+        newUnits[unitId] = next.units[unitId]
+      }
+    }
+    next.units = newUnits
   }
 
   return next
@@ -2379,7 +1730,7 @@ export function undeployUnit(state: BattleState, unitId: string): BattleState {
     const updatedUnit: UnitInstance = {
       ...unit,
       status: 'on_field',
-      remainingUndeployTurns: undefined, // 清除反部署延迟
+      remainingUndeployTurns: 0, // 清除反部署延迟
     }
     next.units[unitId] = updatedUnit
     return next
@@ -2455,43 +1806,7 @@ function fillHandForPlayer(state: BattleState): BattleState {
 }
 
 function fillHandForEnemy(state: BattleState): BattleState {
-  const rule = state.config.resourceRule
-  const currentHandSize = state.enemy.hand.length // 基于输入 state，不是 next
-  
-  // 根据 drawPerTurn 配置补牌，但不超过手牌上限
-  const maxCardsToDraw = rule.handLimit - currentHandSize
-  const cardsToDraw = Math.min(rule.drawPerTurn, maxCardsToDraw)
-
-  // 如果不需要补牌，直接返回
-  if (cardsToDraw <= 0) {
-    return {
-      ...state,
-      enemy: { ...state.enemy },
-    }
-  }
-
-  const next: BattleState = {
-    ...state,
-    enemy: {
-      ...state.enemy,
-      hand: [...state.enemy.hand], // 明确创建新数组，避免引用问题
-      deck: [...state.enemy.deck], // 明确创建新数组，避免修改原数组
-    },
-  }
-
-  if (cardsToDraw > 0) {
-    for (let i = 0; i < cardsToDraw; i++) {
-      if (next.enemy.deck.length > 0) {
-        const newCard = next.enemy.deck.shift()!
-        next.enemy.hand.push(newCard)
-      } else {
-        // 牌堆空了，无法补牌
-        break
-      }
-    }
-  }
-
-  return next
+  return fillHandForEnemyExternal(state)
 }
 
 function checkVictory(state: BattleState): BattleState {
